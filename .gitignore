@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Dados
+# CSV bruto pode ser grande — mantém fora do versionamento
+data/input/*.csv
+# Bases derivadas (regeneráveis)
+data/staging/*.csv
+data/staging/*.parquet
+data/output/
+
+# Queries SQL internas (referência à estrutura do banco)
+consulta_bp.txt
+*.sql
+
+# Configurações locais do Claude Code
+.claude/
+
+# Modelos/cache
+.cache/
+*.npy
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
