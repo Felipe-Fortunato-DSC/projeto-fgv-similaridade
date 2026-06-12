@@ -11,3 +11,6 @@ sentence_transformers==3.4.1
 watermark==2.5.0
 streamlit==1.39.0
 pyarrow==17.0.0
+rapidfuzz==3.10.1
+pytest==8.3.3
+snowflake-connector-python[pandas]>=3.17.0,<4.0.0

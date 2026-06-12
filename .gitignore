@@ -11,8 +11,12 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# Streamlit
+# Streamlit / segredos
 .streamlit/secrets.toml
+secrets.txt
+secrets.toml
+*.pem
+*.key
 
 # Dados
 # CSV bruto pode ser grande — mantém fora do versionamento
@@ -21,6 +25,14 @@ data/input/*.csv
 data/staging/*.csv
 data/staging/*.parquet
 data/output/
+
+# Feedback de validação (rótulos podem ser sensíveis)
+data/training/*.jsonl
+data/training/*.csv
+!data/training/.gitkeep
+
+# Gold standard preenchido (manter só o template no repo)
+data/eval/gold_standard.csv
 
 # Queries SQL internas (referência à estrutura do banco)
 consulta_bp.txt
