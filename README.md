@@ -1,9 +1,20 @@
 # Projeto FGV — Consulta por Similaridade (SPDO)
 
 Sistema de busca de insumos similares a partir de descrição livre, marca e medida.
-Combina **embeddings semânticos SBERT** (modelo multilíngue PT-BR) com **busca KNN**
-(distância cosseno) e uma camada de **penalização Levenshtein** sobre marca, medida e
-descrição padronizadas.
+Combina **embeddings semânticos SBERT** (multilíngue PT-BR) com **busca KNN**
+(cosseno) e uma camada de **scoring composto** (similaridade de tokens + comparação
+numérica de medida). Inclui captura de feedback de validação para fine-tuning
+futuro do modelo de embedding.
+
+## Stack
+
+- **Python 3.11+**
+- **Streamlit** (frontend)
+- **Snowflake** (fonte de verdade dos dados)
+- **sentence-transformers** (SBERT)
+- **scikit-learn** (KNN)
+- **rapidfuzz** (similaridade de tokens)
+- **pandas / numpy / pyarrow**
 
 ## Estrutura do projeto
 
@@ -11,164 +22,143 @@ descrição padronizadas.
 projeto_fgv_similaridade/
 ├── app.py                          # Entry point do Streamlit
 ├── requirements.txt
+├── pyproject.toml                  # Metadata + config de tooling (pytest, ruff)
+├── Makefile                        # Comandos comuns (run, test, seed, lint)
 ├── README.md
 ├── .gitignore
 │
 ├── .streamlit/
-│   └── secrets.toml                # Credenciais Snowflake (NUNCA commitar)
+│   ├── config.toml                 # Theme + page config
+│   ├── secrets.toml                # Credenciais Snowflake (gitignored)
+│   └── secrets.toml.example        # Template para onboarding
 │
-├── src/                            # Código de domínio
+├── src/                            # Código de domínio (pacote Python)
 │   ├── config.py                   # Paths, pesos default, versão
 │   ├── data_process.py             # Padronização de texto/medidas, stopwords
-│   ├── penalty.py                  # Penalização v2 (token + numérica + linear)
+│   ├── penalty.py                  # Scoring composto v2 (token + numérica + linear)
 │   ├── similarity.py               # SBERT + KNN + consulta
 │   ├── knowledge_base.py           # Sincronização incremental Snowflake↔local
 │   ├── snowflake_io.py             # Conexão SF, DDL idempotente, read/write
-│   ├── feedback.py                 # Persistência de validações (JSONL)
-│   └── evaluation.py               # Esqueleto de avaliação (recall@k, MRR)
+│   ├── feedback.py                 # Persistência de validações em SF + JSONL backup
+│   └── evaluation.py               # Esqueleto Recall@k, MRR (uso futuro)
 │
-├── streamlit_app/                  # Camada de apresentação
-│   └── services.py                 # Wrappers cacheados (modelo, KNN, embeddings)
+├── streamlit_app/
+│   └── services.py                 # Wrappers cacheados (modelo, KNN, feedback)
 │
 ├── scripts/
-│   └── seed_snowflake.py           # Bootstrap one-time do parquet → SF
+│   └── seed_snowflake.py           # Bootstrap one-time: parquet local → SF
 │
 ├── tests/
-│   └── test_penalty.py             # 17 testes do módulo de penalização
+│   └── test_penalty.py             # 17 testes do módulo de scoring
 │
-├── notebooks/                      # Pipeline original (referência)
+├── notebooks/                      # Pipeline original (referência histórica)
+│   ├── README.md
 │   ├── 0.padronizar_dados.ipynb
 │   ├── 1.embeddings.ipynb
 │   └── 2.similarity_search.ipynb
 │
-└── data/
-    ├── staging/                    # Cache local (mirror do SF, regenerável)
-    │   ├── medida_correlacao.csv
-    │   ├── df_pad.csv
-    │   └── embeddings_bp.parquet   # cache do KNN em runtime
-    ├── training/
-    │   └── feedback.jsonl          # validações dos usuários (fine-tuning)
-    ├── eval/
-    │   └── gold_standard_template.csv
-    └── output/                     # CSVs de resultado exportados
+├── docs/
+│   └── ROADMAP_FINETUNING.txt      # Plano de fine-tuning pós-meta de feedback
+│
+└── data/                           # Tudo gitignored (cache local + input)
+    ├── input/                      # CSV bruto (backup/dev)
+    ├── staging/                    # Cache do KNN (mirror do SF)
+    ├── training/feedback.jsonl     # Buffer best-effort do feedback
+    ├── eval/gold_standard_template.csv
+    └── output/                     # CSVs exportados de consulta
 ```
 
 ## Arquitetura de dados
 
 ```
-Snowflake (fonte de verdade)                   Local (runtime)
-────────────────────────────                   ───────────────
-TBL_INSUMOS                  ── leitura ─────► (raw)
-TBL_INSUMOS_PADRONIZADOS     ◄── escrita ──── df_pad
-TBL_INSUMOS_PREPROCESSADOS   ◄── escrita ──── df_embeddings
-TBL_INSUMOS_EMBEDDINGS       ◄── escrita ──── embeddings_bp.parquet
+Snowflake (fonte de verdade)                Local (cache de runtime)
+─────────────────────────────                ─────────────────────────
+TBL_INSUMOS                  ── leitura ──►  (raw)
+TBL_INSUMOS_PADRONIZADOS     ◄── escrita ─── df_pad
+TBL_INSUMOS_PREPROCESSADOS   ◄── escrita ─── df_embeddings
+TBL_INSUMOS_EMBEDDINGS       ◄── escrita ─── embeddings_bp.parquet
                               (ARRAY)              │
-TBL_MEDIDAS_CORRELACAO       ◄── escrita ──── medida_correlacao.csv
-                                                  ▼
+TBL_MEDIDAS_CORRELACAO       ◄── escrita ─── medida_correlacao.csv
+TBL_FEEDBACK_VALIDACOES      ◄── escrita ─── feedback.jsonl (backup)
+                                                   ▼
                                           sklearn NearestNeighbors
                                           (KNN em memória)
 ```
 
-- **SF é durável** — múltiplas máquinas/desenvolvedores compartilham a mesma base de embeddings.
+- **SF é durável e centralizada** — múltiplas máquinas/usuários compartilham
+  a mesma base de embeddings e o mesmo histórico de feedback.
 - **Parquet local é cache** — necessário para o KNN em memória rodar rápido.
-- **Sincronização incremental** detecta `CD_INSUMO` ausentes em SF e gera embeddings só para esses.
-- **Rehidratação automática** — se o cache local estiver vazio em uma máquina nova, o app baixa embeddings da SF (rápido, não regera).
+- **Sincronização incremental** detecta `CD_INSUMO` ausentes em SF e gera
+  embeddings só para esses. No idle (nada novo) o sync termina em ~8s.
+- **Rehidratação automática** — se o cache local estiver vazio em uma máquina
+  nova, o app baixa embeddings da SF (rápido, não regera).
+- **Feedback de validação** vai para SF como fonte de verdade; JSONL local é
+  buffer best-effort (útil em dev, irrelevante no Streamlit Cloud).
 
-## Instalação
+## Setup local
 
-```bash
+```powershell
+# 1. Instalar dependências
 pip install -r requirements.txt
-```
 
-## Configuração das credenciais Snowflake
+# 2. Configurar credenciais Snowflake
+copy .streamlit\secrets.toml.example .streamlit\secrets.toml
+# editar .streamlit\secrets.toml com as credenciais reais
 
-Crie `.streamlit/secrets.toml` (já está no `.gitignore`):
-
-```toml
-[snowflake]
-account = "seu_account_identifier"
-user = "seu_usuario"
-password = "sua_senha"
-role = "BASES_SPDO"
-warehouse = "..."
-database = "BASES_SPDO"
-schema = "DB_GESTAO_BANCO_PRECO_APP_CONSULTA"
-```
-
-## Execução
-
-### Bootstrap (rodar UMA vez por ambiente novo)
-
-Se você já tem `data/staging/embeddings_bp.parquet` localmente (embeddings já
-gerados em outra etapa), sobe para a SF para evitar regerar:
-
-```bash
+# 3. Bootstrap (se já tem embeddings_bp.parquet local — evita regerar)
 python scripts/seed_snowflake.py
-```
 
-O script é idempotente — pode rodar quantas vezes quiser, só insere o que
-falta. Se o parquet local não existir, pule essa etapa e use o app direto.
-
-### Frontend Streamlit
-
-```bash
+# 4. Rodar a app
 streamlit run app.py
 ```
 
-Fluxo no app:
+## Setup no Streamlit Community Cloud
 
-1. **Primeiro acesso a uma máquina** — clique em **Sincronizar base** na
-   sidebar. O app:
-   - Lê `TBL_INSUMOS` na SF.
-   - Baixa embeddings já presentes na SF para o cache local (rápido).
-   - Gera embeddings só para `CD_INSUMO` que não estão em `TBL_INSUMOS_EMBEDDINGS`.
-   - Insere os novos nas tabelas SF (`TBL_INSUMOS_PADRONIZADOS`,
-     `TBL_INSUMOS_PREPROCESSADOS`, `TBL_INSUMOS_EMBEDDINGS`).
-2. **Acessos seguintes** — apenas itens novos em `TBL_INSUMOS` são processados.
-3. **Consultar** — preencha descrição (obrigatório), marca e medida (opcionais),
-   ajuste pesos e threshold na sidebar.
-4. **Validar/Reprovar matches** — botões por linha geram registros em
-   `data/training/feedback.jsonl` para fine-tuning futuro.
+1. Push do repositório para o GitHub.
+2. Em https://share.streamlit.io, conectar o repo e apontar para `app.py`.
+3. Em **App settings → Secrets**, colar o conteúdo do `secrets.toml` (com
+   credenciais reais). Streamlit Cloud expõe via `st.secrets`.
+4. Primeiro acesso → modal de sincronização baixa embeddings do SF.
 
-### Pipeline em notebooks (referência)
+## Fluxo no app
 
-Os notebooks reproduzem o pipeline original em três etapas:
+1. **Auto-sync** ao abrir — modal mostra progresso; cache local de
+   KNN é pré-aquecido.
+2. **Consulta** — preencher descrição (obrigatório), marca e medida (opcionais),
+   ajustar pesos e threshold na sidebar.
+3. **Filtro STATUS=AT** ligado por default — esconde insumos descontinuados.
+4. **Validar/Reprovar matches** — botões por linha com popup de confirmação.
+   Cada validação grava um registro em `TBL_FEEDBACK_VALIDACOES` no SF.
+5. **Aba "Feedback registrado"** — dashboard de prontidão para fine-tuning
+   (meta: 1.000 validações + 300 queries únicas).
 
-1. `notebooks/0.padronizar_dados.ipynb` — padroniza a base bruta.
-2. `notebooks/1.embeddings.ipynb` — gera os embeddings SBERT.
-3. `notebooks/2.similarity_search.ipynb` — treina KNN e consulta.
+## Comandos rápidos
 
-Os notebooks fazem `chdir` automático para a raiz, então podem ser abertos
-diretamente de `notebooks/` sem ajuste manual de path.
-
-## Como funciona a sincronização incremental
-
-`src/knowledge_base.sincronizar_base()`:
-
-1. Lê `data/input/consulta_bp.csv` e aplica a padronização do notebook 0
-   (`fillna`, criação de `INSUMO_DESCRICAO`, `MEDIDA_PAD`, `MEDIDA_ABV`,
-   `padronizar_medida`, `preprocess_text`, `remove_stopwords`).
-2. Regrava `df_pad.csv` e `medida_correlacao.csv` (são baratos).
-3. Se `embeddings_bp.parquet` existir, lê os `CD_INSUMO` já presentes;
-   senão, considera primeira carga.
-4. Codifica com SBERT apenas os registros novos.
-5. Concatena e grava o parquet atualizado.
-
-Resultado: na primeira execução, processa tudo. Depois, só itens novos.
-
-## Configuração
-
-`src/config.py` centraliza todos os caminhos. Mude lá se precisar mover
-diretórios ou apontar para outra base.
-
-## Dados de entrada
-
-`data/input/consulta_bp.csv` é esperado com as colunas:
-
-```
-GRP_INSUMO, CD_INSUMO, INSUMO, DESCRICAO, MARCA, CD_MEDIDA, MEDIDA,
-QTD_MEDIDA, EMBALAGEM, STATUS
+```bash
+make install   # pip install -r requirements.txt
+make run       # streamlit run app.py
+make test      # pytest
+make seed      # bootstrap one-time
+make lint      # ruff check
+make format    # ruff format
 ```
 
-`CD_INSUMO` é a chave usada para detectar registros novos na sincronização
-incremental.
+## Roadmap de fine-tuning
+
+Plano completo em **`docs/ROADMAP_FINETUNING.txt`** — 7 fases após a meta de
+coleta:
+
+1. Preparação dos dados (EDA, dedup, split estratificado por query)
+2. Hard negative mining
+3. Loop de treino com OnlineContrastiveLoss
+4. Avaliação contra baseline
+5. Versionamento e deploy
+6. A/B test no app
+7. Re-treino contínuo
+
+## Testes
+
+```bash
+pytest
+# 17 testes do penalty (edge cases dos bugs corrigidos + comportamentos novos)
+```

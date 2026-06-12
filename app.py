@@ -41,8 +41,12 @@ from src.config import (
 from src import feedback
 from streamlit_app.services import (
     base_existe,
+    carregar_feedback_cached,
     carregar_indice,
     carregar_modulos,
+    estatisticas_detalhadas_cached,
+    estatisticas_feedback_cached,
+    invalidar_cache_feedback,
     invalidar_cache_indice,
     parquet_mtime,
     total_codificados,
@@ -104,6 +108,7 @@ def _save_single_feedback(row_dict: dict, label: int) -> None:
         knn_k=st.session_state.knn_k,
     )
     feedback.salvar_feedback([registro])
+    invalidar_cache_feedback()
 
 
 @st.dialog("Confirmar avaliação")
@@ -281,7 +286,7 @@ with st.sidebar:
 
     st.divider()
     st.header("Feedback registrado")
-    stats_fb = feedback.estatisticas_feedback()
+    stats_fb = estatisticas_feedback_cached()
     c1, c2, c3 = st.columns(3)
     c1.metric("Total", stats_fb['total'])
     c2.metric("✅", stats_fb['aprovados'])
@@ -476,7 +481,7 @@ with tab_consulta:
 
 
 with tab_feedback:
-    stats = feedback.estatisticas_detalhadas()
+    stats = estatisticas_detalhadas_cached()
 
     # ---------- Indicador de prontidão (verde / X) ----------
     if stats["pronto_treino"]:
@@ -570,7 +575,7 @@ with tab_feedback:
                 st.caption("Sem queries.")
 
         with st.expander("📋 Registros brutos (JSONL → tabela)", expanded=False):
-            df_fb = feedback.carregar_feedback()
+            df_fb = carregar_feedback_cached()
             st.dataframe(df_fb, use_container_width=True, hide_index=True)
             if FEEDBACK_JSONL.exists():
                 st.download_button(

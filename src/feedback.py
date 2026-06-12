@@ -1,21 +1,33 @@
 """Persistência de feedback de validação para fine-tuning futuro.
 
-Armazena cada validação como uma linha JSON em
-``data/training/feedback.jsonl``. Formato append-only e schema-evolution
-friendly (campos podem ser adicionados sem migrar histórico).
+**Snowflake é a fonte de verdade** (``TBL_FEEDBACK_VALIDACOES``). O JSONL
+local em ``data/training/feedback.jsonl`` é mantido como buffer/backup —
+útil em desenvolvimento e como fallback resiliente caso a SF esteja
+temporariamente indisponível. No Streamlit Cloud o JSONL é efêmero
+(container reinicia → arquivo some), por isso a SF é obrigatória em
+produção.
 
-A leitura via ``carregar_feedback`` retorna um DataFrame com colunas
-achatadas (``user_input.descricao``, ``scores.sbert``, etc.) para análise.
+Schema (achatado) lido pelo restante do app:
+
+  feedback_id, timestamp, session_id,
+  user_input.{descricao, marca, medida},
+  match.{cd_insumo, grp_insumo, descricao, marca, medida, status},
+  scores.{sbert, desc_tokens, marca_tokens, medida_numeric, final},
+  rank, label, app_version, knn_k, weights_snapshot
 """
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 
 import pandas as pd
 
 from .config import APP_VERSION, FEEDBACK_JSONL
+from . import snowflake_io as sf
+
+logger = logging.getLogger(__name__)
 
 
 def gerar_session_id() -> str:
@@ -33,8 +45,9 @@ def montar_registro(
     weights_snapshot: dict,
     knn_k: int,
 ) -> dict:
-    """Monta o registro com timestamp e versão do app preenchidos."""
+    """Monta o registro com timestamp, id e versão do app preenchidos."""
     return {
+        "feedback_id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "session_id": session_id,
         "user_input": user_input,
@@ -48,19 +61,42 @@ def montar_registro(
     }
 
 
-def salvar_feedback(rows: list[dict]) -> int:
-    """Append de registros no JSONL. Retorna a quantidade salva."""
-    if not rows:
+def _escrever_jsonl_local(registros: list[dict]) -> None:
+    """Append best-effort ao JSONL local. Não falha se filesystem read-only."""
+    try:
+        FEEDBACK_JSONL.parent.mkdir(parents=True, exist_ok=True)
+        with FEEDBACK_JSONL.open('a', encoding='utf-8') as f:
+            for r in registros:
+                f.write(json.dumps(r, ensure_ascii=False) + '\n')
+    except Exception as e:
+        logger.warning("Falha ao escrever JSONL local (esperado em Streamlit Cloud): %s", e)
+
+
+def salvar_feedback(registros: list[dict]) -> int:
+    """Persiste registros no Snowflake (fonte de verdade) + buffer JSONL local.
+
+    Sempre tenta SF primeiro. Se falhar, mantém JSONL local como rede de
+    segurança e levanta a exceção para o caller decidir como tratar.
+    """
+    if not registros:
         return 0
-    FEEDBACK_JSONL.parent.mkdir(parents=True, exist_ok=True)
-    with FEEDBACK_JSONL.open('a', encoding='utf-8') as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + '\n')
-    return len(rows)
+
+    # Buffer local primeiro (best-effort, não bloqueia se filesystem inacessível)
+    _escrever_jsonl_local(registros)
+
+    # SF — fonte de verdade
+    conn = sf.conectar()
+    try:
+        sf.garantir_tabelas(conn)
+        n = sf.insert_feedback(conn, registros)
+        logger.info("Feedback gravado no Snowflake: %d registros", n)
+        return n
+    finally:
+        conn.close()
 
 
-def carregar_feedback() -> pd.DataFrame:
-    """Lê todos os registros como DataFrame achatado."""
+def _carregar_de_jsonl() -> pd.DataFrame:
+    """Lê o JSONL local como fallback (só para dev / quando SF indisponível)."""
     if not FEEDBACK_JSONL.exists():
         return pd.DataFrame()
     records: list[dict] = []
@@ -74,8 +110,22 @@ def carregar_feedback() -> pd.DataFrame:
     return pd.json_normalize(records)
 
 
+def carregar_feedback() -> pd.DataFrame:
+    """Lê feedback do Snowflake. Fallback para JSONL se SF inacessível."""
+    try:
+        conn = sf.conectar()
+        try:
+            sf.garantir_tabelas(conn)
+            return sf.ler_feedback(conn)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Falha ao ler feedback do SF, usando JSONL local: %s", e)
+        return _carregar_de_jsonl()
+
+
 def estatisticas_feedback() -> dict:
-    """Conta total, aprovados e reprovados (rápido — itera apenas a coluna label)."""
+    """Conta total, aprovados e reprovados (versão enxuta para a sidebar)."""
     df = carregar_feedback()
     if df.empty or 'label' not in df.columns:
         return {"total": 0, "aprovados": 0, "reprovados": 0}
@@ -121,7 +171,6 @@ def estatisticas_detalhadas() -> dict:
     ap_pct = round(100 * aprovados / total, 1) if total else 0.0
     rp_pct = round(100 - ap_pct, 1)
 
-    # Query key: descrição + marca + medida (uppercase, trimmed)
     def _q_key(row):
         d = str(row.get('user_input.descricao') or '').strip().upper()
         m = str(row.get('user_input.marca') or '').strip().upper()
@@ -133,7 +182,6 @@ def estatisticas_detalhadas() -> dict:
     queries_unicas = int(len(q_counts))
     queries_3mais = int((q_counts >= META_MIN_VAL_POR_QUERY).sum())
 
-    # Top 10 queries (descrição apenas, para readability)
     top10 = []
     for qkey, n in q_counts.head(10).items():
         d, m, med = qkey.split('|')
@@ -144,13 +192,12 @@ def estatisticas_detalhadas() -> dict:
             partes.append(f"medida={med}")
         top10.append({"query": " · ".join(partes), "validacoes": int(n)})
 
-    # Distribuição por rank
     ranks_dist = {}
     if 'rank' in df.columns:
         rc = df['rank'].value_counts().sort_index()
         ranks_dist = {int(k): int(v) for k, v in rc.items()}
 
-    desbalanceado = total >= 50 and abs(ap_pct - 50) > 25  # +/-25pp do equilíbrio
+    desbalanceado = total >= 50 and abs(ap_pct - 50) > 25
     pronto = total >= META_VALIDACOES and queries_unicas >= META_QUERIES_UNICAS
 
     return {

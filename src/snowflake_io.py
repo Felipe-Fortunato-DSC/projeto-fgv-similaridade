@@ -33,6 +33,7 @@ TBL_INSUMOS_PADRONIZADOS = "TBL_INSUMOS_PADRONIZADOS"
 TBL_INSUMOS_PREPROCESSADOS = "TBL_INSUMOS_PREPROCESSADOS"
 TBL_INSUMOS_EMBEDDINGS = "TBL_INSUMOS_EMBEDDINGS"
 TBL_MEDIDAS_CORRELACAO = "TBL_MEDIDAS_CORRELACAO"
+TBL_FEEDBACK_VALIDACOES = "TBL_FEEDBACK_VALIDACOES"
 
 EMBEDDING_DIM = 384  # SBERT paraphrase-multilingual-MiniLM-L12-v2
 
@@ -113,6 +114,32 @@ _DDL: dict[str, str] = {
         CREATE TABLE IF NOT EXISTS {TBL_MEDIDAS_CORRELACAO} (
             CD_MEDIDA VARCHAR,
             MEDIDA VARCHAR
+        )
+    """,
+    TBL_FEEDBACK_VALIDACOES: f"""
+        CREATE TABLE IF NOT EXISTS {TBL_FEEDBACK_VALIDACOES} (
+            FEEDBACK_ID VARCHAR PRIMARY KEY,
+            TIMESTAMP_UTC TIMESTAMP_LTZ,
+            SESSION_ID VARCHAR,
+            USER_DESCRICAO VARCHAR,
+            USER_MARCA VARCHAR,
+            USER_MEDIDA VARCHAR,
+            MATCH_CD_INSUMO NUMBER,
+            MATCH_GRP_INSUMO VARCHAR,
+            MATCH_DESCRICAO VARCHAR,
+            MATCH_MARCA VARCHAR,
+            MATCH_MEDIDA VARCHAR,
+            MATCH_STATUS VARCHAR,
+            SCORE_SBERT FLOAT,
+            SCORE_DESC_TOKENS FLOAT,
+            SCORE_MARCA_TOKENS FLOAT,
+            SCORE_MEDIDA_NUM FLOAT,
+            SCORE_FINAL FLOAT,
+            RANK_POSICAO NUMBER,
+            LABEL NUMBER,
+            APP_VERSION VARCHAR,
+            KNN_K NUMBER,
+            WEIGHTS_SNAPSHOT VARIANT
         )
     """,
 }
@@ -339,3 +366,117 @@ def regravar_medida_correlacao(conn, df: pd.DataFrame) -> int:
     with conn.cursor() as cur:
         cur.execute(f"TRUNCATE TABLE IF EXISTS {TBL_MEDIDAS_CORRELACAO}")
     return _write_pandas_tabela(conn, df[["CD_MEDIDA", "MEDIDA"]], TBL_MEDIDAS_CORRELACAO)
+
+
+# ---------------------- Feedback de validações ----------------------
+
+def insert_feedback(conn, registros: list[dict]) -> int:
+    """Insere registros de feedback em TBL_FEEDBACK_VALIDACOES.
+
+    Cada registro deve estar no formato produzido por
+    ``feedback.montar_registro`` (nested dicts: user_input, match, scores,
+    weights_snapshot). ``WEIGHTS_SNAPSHOT`` vira VARIANT via PARSE_JSON.
+    """
+    if not registros:
+        return 0
+
+    df_stage = pd.DataFrame([
+        {
+            "FEEDBACK_ID": r.get("feedback_id"),
+            "TIMESTAMP_UTC": r.get("timestamp"),
+            "SESSION_ID": r.get("session_id"),
+            "USER_DESCRICAO": (r.get("user_input") or {}).get("descricao"),
+            "USER_MARCA": (r.get("user_input") or {}).get("marca"),
+            "USER_MEDIDA": (r.get("user_input") or {}).get("medida"),
+            "MATCH_CD_INSUMO": (r.get("match") or {}).get("cd_insumo"),
+            "MATCH_GRP_INSUMO": (r.get("match") or {}).get("grp_insumo"),
+            "MATCH_DESCRICAO": (r.get("match") or {}).get("descricao"),
+            "MATCH_MARCA": (r.get("match") or {}).get("marca"),
+            "MATCH_MEDIDA": (r.get("match") or {}).get("medida"),
+            "MATCH_STATUS": (r.get("match") or {}).get("status"),
+            "SCORE_SBERT": (r.get("scores") or {}).get("sbert"),
+            "SCORE_DESC_TOKENS": (r.get("scores") or {}).get("desc_tokens"),
+            "SCORE_MARCA_TOKENS": (r.get("scores") or {}).get("marca_tokens"),
+            "SCORE_MEDIDA_NUM": (r.get("scores") or {}).get("medida_numeric"),
+            "SCORE_FINAL": (r.get("scores") or {}).get("final"),
+            "RANK_POSICAO": r.get("rank"),
+            "LABEL": int(r.get("label")) if r.get("label") is not None else None,
+            "APP_VERSION": r.get("app_version"),
+            "KNN_K": r.get("knn_k"),
+            "WEIGHTS_SNAPSHOT_JSON": json.dumps(r.get("weights_snapshot") or {}),
+        }
+        for r in registros
+    ])
+
+    temp_name = f"_TMP_FB_{int(time.time() * 1000)}"
+    from snowflake.connector.pandas_tools import write_pandas
+    success, _, _, _ = write_pandas(
+        conn=conn,
+        df=df_stage,
+        table_name=temp_name,
+        auto_create_table=True,
+        overwrite=True,
+        quote_identifiers=False,
+    )
+    if not success:
+        raise RuntimeError(f"Falha em write_pandas para temp {temp_name}")
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            INSERT INTO {TBL_FEEDBACK_VALIDACOES} (
+                FEEDBACK_ID, TIMESTAMP_UTC, SESSION_ID,
+                USER_DESCRICAO, USER_MARCA, USER_MEDIDA,
+                MATCH_CD_INSUMO, MATCH_GRP_INSUMO, MATCH_DESCRICAO,
+                MATCH_MARCA, MATCH_MEDIDA, MATCH_STATUS,
+                SCORE_SBERT, SCORE_DESC_TOKENS, SCORE_MARCA_TOKENS,
+                SCORE_MEDIDA_NUM, SCORE_FINAL, RANK_POSICAO,
+                LABEL, APP_VERSION, KNN_K, WEIGHTS_SNAPSHOT
+            )
+            SELECT
+                FEEDBACK_ID, TIMESTAMP_UTC, SESSION_ID,
+                USER_DESCRICAO, USER_MARCA, USER_MEDIDA,
+                MATCH_CD_INSUMO, MATCH_GRP_INSUMO, MATCH_DESCRICAO,
+                MATCH_MARCA, MATCH_MEDIDA, MATCH_STATUS,
+                SCORE_SBERT, SCORE_DESC_TOKENS, SCORE_MARCA_TOKENS,
+                SCORE_MEDIDA_NUM, SCORE_FINAL, RANK_POSICAO,
+                LABEL, APP_VERSION, KNN_K, PARSE_JSON(WEIGHTS_SNAPSHOT_JSON)
+            FROM {temp_name}
+        """)
+        n = cur.rowcount
+        cur.execute(f"DROP TABLE IF EXISTS {temp_name}")
+    return int(n)
+
+
+def ler_feedback(conn) -> pd.DataFrame:
+    """Lê TBL_FEEDBACK_VALIDACOES e devolve DataFrame com colunas achatadas
+    no mesmo formato esperado pelo restante do app (``user_input.descricao``,
+    ``scores.sbert``, etc.)."""
+    df = _fetch_df(conn, f"SELECT * FROM {TBL_FEEDBACK_VALIDACOES} ORDER BY TIMESTAMP_UTC")
+    if df.empty:
+        return df
+
+    df = df.rename(columns={
+        "FEEDBACK_ID": "feedback_id",
+        "TIMESTAMP_UTC": "timestamp",
+        "SESSION_ID": "session_id",
+        "USER_DESCRICAO": "user_input.descricao",
+        "USER_MARCA": "user_input.marca",
+        "USER_MEDIDA": "user_input.medida",
+        "MATCH_CD_INSUMO": "match.cd_insumo",
+        "MATCH_GRP_INSUMO": "match.grp_insumo",
+        "MATCH_DESCRICAO": "match.descricao",
+        "MATCH_MARCA": "match.marca",
+        "MATCH_MEDIDA": "match.medida",
+        "MATCH_STATUS": "match.status",
+        "SCORE_SBERT": "scores.sbert",
+        "SCORE_DESC_TOKENS": "scores.desc_tokens",
+        "SCORE_MARCA_TOKENS": "scores.marca_tokens",
+        "SCORE_MEDIDA_NUM": "scores.medida_numeric",
+        "SCORE_FINAL": "scores.final",
+        "RANK_POSICAO": "rank",
+        "LABEL": "label",
+        "APP_VERSION": "app_version",
+        "KNN_K": "knn_k",
+        "WEIGHTS_SNAPSHOT": "weights_snapshot",
+    })
+    return df
