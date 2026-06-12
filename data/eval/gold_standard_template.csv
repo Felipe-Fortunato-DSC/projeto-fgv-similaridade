@@ -1,0 +1,4 @@
+query_descricao,query_marca,query_medida,expected_cd_insumo
+TUBO DE PVC 75MM,TIGRE,12M,501049
+ARROZ POLIDO TIPO 1,TIO JOAO,1KG,
+SERINGA DESCARTAVEL,,5ML,

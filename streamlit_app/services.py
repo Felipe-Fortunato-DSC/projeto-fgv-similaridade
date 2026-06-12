@@ -41,3 +41,30 @@ def carregar_indice(mtime: float, n_neighbors: int):
 
 def invalidar_cache_indice() -> None:
     carregar_indice.clear()
+
+
+# ---------------------- Feedback (cacheado para evitar SF query a cada rerun) ----------------------
+
+@st.cache_data(ttl=30, show_spinner=False)
+def estatisticas_feedback_cached() -> dict:
+    from src import feedback
+    return feedback.estatisticas_feedback()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def estatisticas_detalhadas_cached() -> dict:
+    from src import feedback
+    return feedback.estatisticas_detalhadas()
+
+
+@st.cache_data(ttl=30, show_spinner="Carregando feedback do Snowflake...")
+def carregar_feedback_cached() -> pd.DataFrame:
+    from src import feedback
+    return feedback.carregar_feedback()
+
+
+def invalidar_cache_feedback() -> None:
+    """Chamar após salvar feedback novo para atualizar dashboards no próximo render."""
+    estatisticas_feedback_cached.clear()
+    estatisticas_detalhadas_cached.clear()
+    carregar_feedback_cached.clear()

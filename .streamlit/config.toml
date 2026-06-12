@@ -1,0 +1,17 @@
+[server]
+# Não envia anonymous usage statistics para o Streamlit
+gatherUsageStats = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#0F4C81"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#262730"
+
+[client]
+showSidebarNavigation = true
+showErrorDetails = false

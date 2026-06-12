@@ -1,0 +1,281 @@
+================================================================================
+ROADMAP DE FINE-TUNING -- Projeto FGV Similaridade
+================================================================================
+
+Pre-requisito para iniciar este roadmap:
+  - 1.000+ validacoes totais em data/training/feedback.jsonl
+  - 300+ queries unicas (combinacao descricao + marca + medida)
+  - Status verde "Pronto para fine-tuning" na aba "Feedback registrado" do app
+
+
+--------------------------------------------------------------------------------
+FASE 1 -- PREPARACAO DOS DADOS
+--------------------------------------------------------------------------------
+
+1.1  Analise exploratoria do feedback (notebook em notebooks/eda_feedback.ipynb)
+     - Distribuicao de classes (positivo vs negativo)
+     - Distribuicao de ranks validados (esperado: top-5 dominante)
+     - Diversidade de queries (histograma de N_validacoes por query)
+     - Distribuicao de scores SBERT em aprovados vs reprovados
+     - Deteccao de outliers (queries com validacoes contraditorias)
+
+1.2  Limpeza e normalizacao
+     - Dedupe por (query_key, match_cd_insumo): manter ultima validacao
+     - Detectar validacoes contraditorias: mesma query+match com labels diferentes
+       de session_ids diferentes
+     - Politica de resolucao:
+        a) Filtrar (descartar) se < 3 votos
+        b) Voto majoritario se >= 3 votos
+        c) Marcar como "incerta" para nao usar no treino
+
+1.3  Train / validation split
+     - ESTRATIFICADO POR query_descricao, nao por linha aleatoria
+     - 80% train / 20% val
+     - Queries do val NUNCA podem aparecer no train (evita data leak)
+     - Salvar splits em data/training/splits/{train,val}.jsonl
+
+1.4  Balanceamento de classes
+     - Calcular ratio atual positivo:negativo
+     - Se > 1.5:1 (provavel): aplicar undersampling do positivo OR
+       oversampling do negativo via duplicacao com data augmentation leve
+     - Cap de N pares por query (sugestao N=10) para evitar dominio de queries
+       muito frequentes
+     - Salvar dataset balanceado em data/training/balanced.jsonl
+
+
+--------------------------------------------------------------------------------
+FASE 2 -- HARD NEGATIVE MINING (opcional, mas alto valor)
+--------------------------------------------------------------------------------
+
+2.1  Para cada query no dataset:
+     - Rodar o modelo SBERT atual e pegar top-30 vizinhos
+     - Identificar itens "quase aprovados": score SBERT > 0.7 mas reprovados
+       pelo usuario
+     - Estes sao os hard negatives -- o sinal mais informativo para o modelo
+
+2.2  Adicionar hard negatives ao dataset
+     - Label = 0, weight = 2.0 (peso maior por serem casos mais informativos)
+     - Marcar registros como source="hard_mining" para auditoria
+
+2.3  Considerar tambem semi-hard negatives
+     - Itens com score 0.5-0.7 reprovados (medio sinal)
+     - Util quando hard negatives sao poucos
+
+
+--------------------------------------------------------------------------------
+FASE 3 -- IMPLEMENTACAO DO LOOP DE TREINO
+--------------------------------------------------------------------------------
+
+3.1  Estrutura
+     - Criar src/training.py com classes:
+       * FeedbackDataset(torch.utils.data.Dataset)
+       * Trainer(modelo_base, train_loader, val_loader, loss_fn)
+     - Criar scripts/train_sbert.py como CLI:
+       python scripts/train_sbert.py --epochs 3 --batch 32 --lr 2e-5
+
+3.2  Dependencias adicionais
+     - sentence-transformers (ja em requirements.txt)
+     - torch (vem com sentence-transformers)
+     - Opcional: accelerate para GPU multi-device
+
+3.3  Componentes do training loop
+     - Modelo base: paraphrase-multilingual-MiniLM-L12-v2 (mesmo do baseline)
+     - Loss function: OnlineContrastiveLoss com margin=0.5
+       (alternativa: ContrastiveLoss simples ou CosineSimilarityLoss)
+     - Optimizer: AdamW
+     - Learning rate: 2e-5 (padrao para SBERT fine-tuning)
+     - Warmup steps: 10% do total
+     - Epochs: 1 a 3 (mais que isso = overfit garantido)
+     - Batch size: 32 (ou 16 se OOM em GPU pequena)
+
+3.4  Evaluator durante treino
+     - sentence_transformers.evaluation.EmbeddingSimilarityEvaluator
+       com pares (query, doc, label) do val set
+     - Roda ao fim de cada epoch
+     - Salva checkpoint apenas se metricas melhoram
+
+3.5  Salvar modelo
+     - Path: models/sbert-fgv-v{YYYYMMDD}-{HHMM}/
+     - Estrutura: pytorch_model.bin + config.json + tokenizer + metadata.json
+
+
+--------------------------------------------------------------------------------
+FASE 4 -- AVALIACAO DO MODELO TREINADO
+--------------------------------------------------------------------------------
+
+4.1  Metricas a calcular no val set
+     - Recall@1, Recall@5, Recall@10
+     - MRR (Mean Reciprocal Rank)
+     - Cobertura (% de queries com pelo menos 1 hit no top-10)
+     - Score de separacao: media(score positivos) - media(score negativos)
+
+4.2  Comparacao com baseline
+     - Rodar mesmo val set no modelo original (sem fine-tuning)
+     - Tabela lado a lado das metricas
+
+4.3  Criterio de aceitacao
+     - Recall@5 melhora >= 5 pontos percentuais sobre baseline
+     - Nao houver regressao em nenhuma metrica > 2 pp
+     - Se nao passar -> DESCARTAR o modelo (nao deploy)
+     - Se passar -> proxima fase
+
+4.4  Analise qualitativa
+     - Selecionar 20 queries aleatorias do val
+     - Rodar com baseline e novo modelo
+     - Inspecionar diferencas nos top-5 manualmente
+     - Documentar casos onde o novo eh melhor / pior
+
+
+--------------------------------------------------------------------------------
+FASE 5 -- VERSIONAMENTO E DEPLOY
+--------------------------------------------------------------------------------
+
+5.1  Estrutura de versoes
+     models/
+       sbert-fgv-v20260801-1430/
+         pytorch_model.bin
+         tokenizer.json
+         config.json
+         metadata.json   <- contem:
+            - data_treino: range de timestamps dos feedbacks usados
+            - n_pares_treino, n_pares_val
+            - balanco positivo:negativo
+            - metricas no val (Recall@1/5/10, MRR)
+            - hiperparametros (lr, batch, epochs, seed)
+            - git_commit do codigo usado
+            - usuario que treinou
+       active -> symlink para a versao em producao
+
+5.2  Atualizar src/config.py
+     - Trocar SBERT_MODEL_NAME por SBERT_MODEL_PATH
+     - Permitir override via env var FGV_SBERT_MODEL para A/B test
+     - Default: aponta para models/active
+
+5.3  Bootstrap dos novos embeddings
+     - Modelo novo = embeddings diferentes
+     - Rodar scripts/regerar_embeddings.py para refazer TODA a base com modelo
+       novo (e atualizar SF e parquet local)
+     - ATENCAO: operacao cara (~horas). Planejar janela de manutencao.
+
+
+--------------------------------------------------------------------------------
+FASE 6 -- A/B TEST NO APP
+--------------------------------------------------------------------------------
+
+6.1  UI
+     - Sidebar: dropdown "Modelo: baseline / fine-tuned vN / fine-tuned vM"
+     - Default: 50/50 random (transparente para o usuario)
+     - Modo manual: usuario power-user pode escolher
+
+6.2  Logging
+     - Cada feedback registra "model_version" usado naquela consulta
+     - Coleta paralela de feedback para cada variante
+
+6.3  Analise
+     - Apos N validacoes por variante (sugestao N=200), comparar:
+       * % de aprovacao no top-5
+       * Distribuicao de ranks aprovados
+       * Tempo medio de aprovacao (proxy de confianca)
+     - Promover variante vencedora; descartar outras
+
+6.4  Cuidados estatisticos
+     - Nao olhar resultados antes de atingir N -- viesa decisao
+     - Aplicar correcao de teste sequencial (Bonferroni ou similar)
+
+
+--------------------------------------------------------------------------------
+FASE 7 -- RE-TREINO CONTINUO (operacao de longo prazo)
+--------------------------------------------------------------------------------
+
+7.1  Gatilho de re-treino
+     - A cada +500 novos feedbacks: avaliar se vale retreinar
+     - Indicadores de necessidade:
+       * Queda de Recall@5 nas ultimas N consultas
+       * Aumento de "Reprovados" no top-3
+       * Drift de vocabulario (queries com tokens novos frequentes)
+
+7.2  Pipeline automatizado (futuro)
+     - GitHub Actions ou Airflow agendando treino mensal
+     - Avaliacao automatica
+     - PR automatico para promover modelo se passar
+
+7.3  Manutencao
+     - Manter ultimas 3 versoes em models/ para rollback rapido
+     - Arquivar versoes antigas em storage frio (S3 IA / SF Stage)
+     - Documentar mudancas em CHANGELOG_MODELS.md
+
+
+--------------------------------------------------------------------------------
+CHECKLIST PRE-TREINAMENTO (revisar item por item antes de comecar a Fase 3)
+--------------------------------------------------------------------------------
+
+[ ]  Meta de coleta atingida (1.000+ validacoes, 300+ queries unicas)
+[ ]  Status verde na aba "Feedback registrado"
+[ ]  EDA executado (notebook salvo)
+[ ]  Balanco de classes calculado e estrategia decidida
+[ ]  Hard negatives identificados (Fase 2)
+[ ]  Split estratificado feito (sem leak)
+[ ]  Metricas baseline calculadas no val set
+[ ]  GPU disponivel ou OK rodar em CPU (~1-3h para 1k pares)
+[ ]  ~5 GB de disco livre para checkpoints
+[ ]  Branch separada criada (nao na main)
+
+
+--------------------------------------------------------------------------------
+RISCOS A MITIGAR
+--------------------------------------------------------------------------------
+
+R1  Overfitting em queries muito frequentes
+    -> Cap de N pares por query no balanceamento
+
+R2  Modelo regredindo em queries genericas (catastrophic forgetting)
+    -> Manter peso menor para fine-tuning (lr baixo, epochs poucas)
+    -> Avaliar tambem em queries fora do dominio coletado
+
+R3  Drift de dominio (novos insumos com vocabulario novo)
+    -> Reavaliar metricas a cada release; gatilho automatico se cair
+
+R4  Vieses de annotator (criterios diferentes entre usuarios)
+    -> Analise inter-annotator no EDA
+    -> Considerar peso por session_id baseado em consistencia
+
+R5  Validacoes contraditorias
+    -> Politica de resolucao decidida na Fase 1.2
+
+R6  Tempo de treino bloqueia desenvolvimento
+    -> Sempre em branch separada; main fica estavel
+
+
+--------------------------------------------------------------------------------
+ARQUIVOS A CRIAR DURANTE EXECUCAO
+--------------------------------------------------------------------------------
+
+src/training.py                       # Dataset + Trainer
+src/eval_finetuning.py                # Recall@k, MRR, comparacao
+scripts/train_sbert.py                # CLI de treino
+scripts/regerar_embeddings.py         # Refaz base com modelo novo
+notebooks/eda_feedback.ipynb          # Analise exploratoria
+data/training/splits/train.jsonl      # Pares de treino balanceados
+data/training/splits/val.jsonl        # Pares de validacao
+models/sbert-fgv-v.../                # Modelos versionados
+docs/CHANGELOG_MODELS.md              # Historico de versoes
+
+
+--------------------------------------------------------------------------------
+ESTIMATIVA DE ESFORCO (referencia)
+--------------------------------------------------------------------------------
+
+Fase 1 (preparacao)        : 1-2 dias
+Fase 2 (hard mining)       : 0.5-1 dia
+Fase 3 (training loop)     : 2-3 dias
+Fase 4 (avaliacao)         : 1 dia
+Fase 5 (versionamento)     : 1 dia
+Fase 6 (A/B test)          : 2-3 dias (incl. coleta)
+Fase 7 (re-treino)         : continuo
+
+TOTAL primeira execucao    : ~2 semanas (com testes)
+
+
+================================================================================
+FIM DO ROADMAP
+================================================================================
