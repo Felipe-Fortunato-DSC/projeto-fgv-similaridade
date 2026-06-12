@@ -40,8 +40,38 @@ EMBEDDING_DIM = 384  # SBERT paraphrase-multilingual-MiniLM-L12-v2
 
 # ---------------------- Credenciais & conexão ----------------------
 
+def _config_do_ambiente() -> dict | None:
+    """Lê credenciais de variáveis de ambiente (SNOWFLAKE_*).
+
+    Mecanismo usado no deploy em container (ECS/Docker), onde os segredos são
+    injetados em runtime — sem arquivo no repositório nem na imagem. Retorna
+    ``None`` se as variáveis obrigatórias (account/user/password) não estiverem
+    todas presentes, para que o caller faça fallback ao arquivo TOML.
+    """
+    import os
+    mapa = {
+        "account": "SNOWFLAKE_ACCOUNT",
+        "user": "SNOWFLAKE_USER",
+        "password": "SNOWFLAKE_PASSWORD",
+        "role": "SNOWFLAKE_ROLE",
+        "warehouse": "SNOWFLAKE_WAREHOUSE",
+        "database": "SNOWFLAKE_DATABASE",
+        "schema": "SNOWFLAKE_SCHEMA",
+    }
+    cfg = {k: os.environ[v] for k, v in mapa.items() if os.environ.get(v)}
+    if not all(cfg.get(k) for k in ("account", "user", "password")):
+        return None
+    return cfg
+
+
 def load_config() -> dict:
-    """Carrega config Snowflake. Prioriza st.secrets se dentro do Streamlit."""
+    """Carrega config Snowflake.
+
+    Ordem de prioridade:
+    1. ``st.secrets`` (Streamlit Community Cloud / .streamlit/secrets.toml),
+    2. variáveis de ambiente ``SNOWFLAKE_*`` (deploy em container),
+    3. arquivo ``.streamlit/secrets.toml`` (dev local / mount em runtime).
+    """
     try:
         import streamlit as st
         if hasattr(st, "secrets") and "snowflake" in st.secrets:
@@ -49,10 +79,15 @@ def load_config() -> dict:
     except Exception:
         pass
 
+    cfg_env = _config_do_ambiente()
+    if cfg_env is not None:
+        return cfg_env
+
     if not SECRETS_PATH.exists():
         raise FileNotFoundError(
-            f"Credenciais Snowflake não encontradas em {SECRETS_PATH}. "
-            "Crie o arquivo com seção [snowflake] (account/user/password/...)."
+            f"Credenciais Snowflake não encontradas. Forneça uma das opções: "
+            f"variáveis de ambiente SNOWFLAKE_ACCOUNT/USER/PASSWORD/... ou o "
+            f"arquivo {SECRETS_PATH} com seção [snowflake]."
         )
     with SECRETS_PATH.open("rb") as f:
         data = tomllib.load(f)

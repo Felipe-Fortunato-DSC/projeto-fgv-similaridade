@@ -1,0 +1,5 @@
+# Garante LF em arquivos que rodam em Linux/WSL (evita 'bad interpreter: ^M').
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+.dockerignore text eol=lf
+*.env.example text eol=lf

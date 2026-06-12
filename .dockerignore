@@ -1,0 +1,51 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# SEGREDOS — nunca entram na imagem
+secrets
+secrets.toml
+secrets.txt
+.streamlit/secrets.toml
+.env
+*.env
+*.pem
+*.key
+
+# Ambientes / caches Python
+.venv
+venv
+env
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+build
+dist
+
+# Dados locais e artefatos regeneráveis (baixados do Snowflake em runtime)
+data/input/*
+data/staging/*
+data/output/*
+data/training/*
+!data/**/.gitkeep
+
+# Material que não roda no container
+notebooks
+docs
+tests
+.devcontainer
+.vscode
+.idea
+.claude
+.DS_Store
+Thumbs.db
+
+# Docker / CI
+Dockerfile
+.dockerignore

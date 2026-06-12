@@ -24,6 +24,11 @@ dist/
 .streamlit/secrets.toml
 secrets.txt
 secrets.toml
+secrets
+/secrets
+.env
+*.env
+!.env.example
 *.pem
 *.key
 
