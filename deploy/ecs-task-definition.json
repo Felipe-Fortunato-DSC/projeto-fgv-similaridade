@@ -1,0 +1,50 @@
+{
+  "__comentario__": "Template de task definition para Fargate. Substitua os <PLACEHOLDERS>. NÃO há secrets: a app acessa Athena/Glue/S3/S3 Vectors via taskRoleArn (IAM role da task). Ajuste as permissões da role (ver deploy/DEPLOY_ECS.md).",
+  "family": "consulta-similaridade",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/consultaSimilaridadeTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "consulta-similaridade",
+      "image": "<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/<REPO_NAME>:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8501,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "AWS_REGION",        "value": "us-east-1" },
+        { "name": "ATHENA_DATABASE",   "value": "db_spdo_apps" },
+        { "name": "S3_DATA_BASE",      "value": "s3://ibre-spdo-coleta-bronze/apps/consulta_similaridade" },
+        { "name": "S3_VECTORS_BUCKET", "value": "spdo-embeddings" },
+        { "name": "S3_VECTORS_INDEX",  "value": "insumos-sbert-384" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fsS http://localhost:8501/_stcore/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 90
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/consulta-similaridade",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

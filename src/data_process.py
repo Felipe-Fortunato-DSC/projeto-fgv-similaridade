@@ -5,8 +5,13 @@ import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 
-nltk.download('punkt_tab')
-nltk.download('stopwords')
+# Corpora NLTK: no Docker já vêm pré-baixados (NLTK_DATA). Localmente, baixa
+# silenciosamente na primeira execução (no-op se já presentes).
+for _pkg in ("punkt_tab", "stopwords"):
+    try:
+        nltk.download(_pkg, quiet=True)
+    except Exception:
+        pass
 
 def padronizar_medida(medida):
     # Padroniza unidades de medida para valores numéricos homogêneos, mas mantém as unidades não padronizáveis inalteradas.
@@ -63,10 +68,9 @@ def remover_palavras_duplicadas(df, colunas):
     return df
 
 # Função para converter a sigla para a medida por extenso
-def converter_medida(input_value):
-    # Carregando df com medidas padronizadas
-    from .config import MEDIDA_CORRELACAO_CSV
-    df_medida = pd.read_csv(MEDIDA_CORRELACAO_CSV)
+def converter_medida(input_value, df_medida):
+    # df_medida: DataFrame com colunas CD_MEDIDA, MEDIDA (vindo do Athena, cacheado).
+    df_medida = df_medida.copy()
     # Remove todos os espaços
     input_value = input_value.replace(" ", "")
     # Usando regex para separar o número da sigla

@@ -46,6 +46,12 @@ data/eval/gold_standard.csv
 # Queries SQL internas (referência à estrutura do banco)
 consulta_bp.txt
 *.sql
+# Exceto o DDL/estrutura do Athena, que faz parte do deploy
+!deploy/athena/*.sql
+
+# Variáveis de ambiente locais (credenciais/config)
+.env
+deploy/.env
 
 # Configurações locais do Claude Code
 .claude/

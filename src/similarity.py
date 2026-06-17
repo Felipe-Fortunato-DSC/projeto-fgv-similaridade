@@ -1,16 +1,24 @@
-"""Pipeline de embeddings SBERT + KNN + consulta com penalização v2."""
+"""Busca por similaridade — SBERT (encode) + S3 Vectors (k-NN) + penalização v2.
+
+A busca k-NN deixou de rodar em memória (sklearn). Agora:
+
+1. A query é codificada pelo SBERT (no processo).
+2. O S3 Vectors retorna o top-K ``cd_insumo`` + distância cosseno.
+3. Os candidatos são hidratados a partir de DataFrames em memória
+   (``df_pad`` para display, ``df_embeddings`` preprocessado para a penalização)
+   e reordenados pela combinação linear ponderada de ``penalty``.
+"""
 from __future__ import annotations
 
 import logging
 
 import numpy as np
-from tqdm import tqdm
-from sklearn.neighbors import NearestNeighbors
+import pandas as pd
 from sentence_transformers import SentenceTransformer
 
-from .config import SBERT_MODEL_NAME, DEFAULT_WEIGHTS, DEFAULT_THRESHOLD
-from .data_process import padronizar_medida, preprocess_text, remove_stopwords, converter_medida
-from . import penalty
+from .config import DEFAULT_THRESHOLD, DEFAULT_TOP_K, DEFAULT_WEIGHTS, SBERT_MODEL_NAME
+from .data_process import converter_medida, padronizar_medida, preprocess_text, remove_stopwords
+from . import aws_io, penalty
 
 logger = logging.getLogger(__name__)
 
@@ -18,30 +26,21 @@ logger = logging.getLogger(__name__)
 sbert_model = SentenceTransformer(SBERT_MODEL_NAME)
 
 
-def gerar_embeddings(df, colunas):
-    df['bert_vectors'] = [
-        sbert_model.encode(row, convert_to_numpy=True)
-        for row in tqdm(
-            df[colunas].astype(str).agg(' '.join, axis=1),
-            desc="Processando embeddings",
+def encode_textos(textos: list[str], batch_size: int = 64) -> list[np.ndarray]:
+    """Encode em lote (usado pelo seed e pela sincronização incremental)."""
+    return list(
+        sbert_model.encode(
+            textos, batch_size=batch_size, convert_to_numpy=True, show_progress_bar=False
         )
-    ]
-    return df
+    )
 
 
-def treinar_knn(df, metric='cosine', n_neighbors=5):
-    X_train = np.array(df['bert_vectors'].tolist())
-    knn_model = NearestNeighbors(n_neighbors=n_neighbors, algorithm='auto', metric=metric)
-    knn_model.fit(X_train)
-    return knn_model
-
-
-def _processar_query(descricao: str, marca: str, medida: str) -> dict:
+def _processar_query(descricao: str, marca: str, medida: str, df_medida: pd.DataFrame) -> dict:
     """Aplica a mesma pipeline de padronização que df_embeddings.MEDIDA/MARCA/DESC."""
     desc_p = remove_stopwords(preprocess_text(descricao))
     marca_p = remove_stopwords(preprocess_text(marca or ""))
     if medida and medida.strip():
-        med_canon = padronizar_medida(converter_medida(medida))
+        med_canon = padronizar_medida(converter_medida(medida, df_medida))
         med_p = remove_stopwords(preprocess_text(str(med_canon).replace(".0", "")))
     else:
         med_p = ""
@@ -51,65 +50,74 @@ def _processar_query(descricao: str, marca: str, medida: str) -> dict:
 def consultar_item(
     descricao: str,
     medida: str,
-    knn_model,
-    df_pad,
-    df_embeddings,
+    df_pad: pd.DataFrame,
+    df_embeddings: pd.DataFrame,
+    df_medida: pd.DataFrame,
     marca: str = "SEM MARCA",
     *,
     weights: dict | None = None,
     threshold: float = DEFAULT_THRESHOLD,
+    top_k: int = DEFAULT_TOP_K,
 ):
-    """Busca os ``k`` vizinhos mais próximos via SBERT+KNN e reordena pela
-    combinação linear ponderada definida em ``penalty``.
+    """Busca top-K vizinhos no S3 Vectors e reordena pela penalização v2.
 
-    Retorna um DataFrame com colunas:
+    ``df_pad``/``df_embeddings`` devem estar indexados por CD_INSUMO (ver
+    ``streamlit_app.services``). Retorna DataFrame com colunas:
       CD_INSUMO, GRP_INSUMO, INSUMO_DESCRICAO, MARCA, MEDIDA, STATUS (se houver),
       CONSULTA, SCORE_SBERT, SIM_DESC, SIM_MARCA, SIM_MEDIDA, SCORE, RANK.
     """
     weights = weights or DEFAULT_WEIGHTS
-    query_proc = _processar_query(descricao, marca, medida)
+    query_proc = _processar_query(descricao, marca, medida, df_medida)
     query_text = f"{query_proc['descricao']} {query_proc['marca']} {query_proc['medida']}".strip()
     logger.info("Consulta processada: %r", query_text)
 
-    consulta_vector = sbert_model.encode(query_text, convert_to_numpy=True).reshape(1, -1)
-    distances, indices = knn_model.kneighbors(consulta_vector)
-    idx_flat = indices.flatten()
+    emb = sbert_model.encode(query_text, convert_to_numpy=True)
+    vizinhos = aws_io.query_vectors(emb, top_k=top_k)  # [(cd_insumo, distancia), ...]
 
-    # Cópia para display (formato legível, preserva STATUS).
-    resultados = df_pad.iloc[idx_flat].copy()
-    resultados = resultados.loc[:, ~resultados.columns.str.contains('^Unnamed')]
-    resultados['CONSULTA'] = descricao
+    cols_saida = ["CD_INSUMO", "GRP_INSUMO", "INSUMO_DESCRICAO", "MARCA", "MEDIDA"]
+    if "STATUS" in df_pad.columns:
+        cols_saida.append("STATUS")
+    if not vizinhos:
+        return pd.DataFrame(columns=cols_saida + [
+            "CONSULTA", "SCORE_SBERT", "SIM_DESC", "SIM_MARCA", "SIM_MEDIDA", "SCORE", "RANK",
+        ])
 
-    # Cosseno → similaridade [0, 1] (KNN devolve 1 - cos_sim como distância).
-    sbert_sims = np.clip(1.0 - distances.flatten(), 0.0, 1.0)
-    resultados['SCORE_SBERT'] = sbert_sims
-
-    # Versões pré-processadas dos candidatos (usadas para cálculo de sims).
-    df_proc = df_embeddings.iloc[idx_flat][['INSUMO_DESCRICAO', 'MARCA', 'MEDIDA']]
-
-    sims_desc, sims_marca, sims_medida, scores_final = [], [], [], []
-    for (_, doc_row), sbert_sim in zip(df_proc.iterrows(), sbert_sims):
+    linhas = []
+    for cd, dist in vizinhos:
+        if cd not in df_pad.index or cd not in df_embeddings.index:
+            continue
+        disp = df_pad.loc[cd]
+        proc = df_embeddings.loc[cd]
+        sbert_sim = float(np.clip(1.0 - dist, 0.0, 1.0))
         doc = {
-            "descricao": str(doc_row['INSUMO_DESCRICAO']),
-            "marca": str(doc_row['MARCA']),
-            "medida": str(doc_row['MEDIDA']),
+            "descricao": str(proc["INSUMO_DESCRICAO"]),
+            "marca": str(proc["MARCA"]),
+            "medida": str(proc["MEDIDA"]),
         }
         sims = penalty.calcular_similaridades(query_proc, doc)
-        final, _w_used = penalty.combinar_score(sbert_sim, sims, query_proc, weights)
-        sims_desc.append(sims['desc'])
-        sims_marca.append(sims['marca'])
-        sims_medida.append(sims['medida'])
-        scores_final.append(final)
+        final, _w = penalty.combinar_score(sbert_sim, sims, query_proc, weights)
+        linha = {
+            "CD_INSUMO": cd,
+            "GRP_INSUMO": disp["GRP_INSUMO"],
+            "INSUMO_DESCRICAO": disp["INSUMO_DESCRICAO"],
+            "MARCA": disp["MARCA"],
+            "MEDIDA": disp["MEDIDA"],
+            "CONSULTA": descricao,
+            "SCORE_SBERT": sbert_sim,
+            "SIM_DESC": sims["desc"],
+            "SIM_MARCA": sims["marca"],
+            "SIM_MEDIDA": sims["medida"],
+            "SCORE": final * 100,
+        }
+        if "STATUS" in df_pad.columns:
+            linha["STATUS"] = disp["STATUS"]
+        linhas.append(linha)
 
-    resultados['SIM_DESC'] = sims_desc
-    resultados['SIM_MARCA'] = sims_marca
-    resultados['SIM_MEDIDA'] = sims_medida
-    resultados['SCORE'] = [v * 100 for v in scores_final]
-
-    # Ordenação e filtro acontecem UMA vez, fora de qualquer loop.
-    resultados = resultados.sort_values('SCORE', ascending=False)
-    resultados = resultados[resultados['SCORE'] >= float(threshold)]
+    resultados = pd.DataFrame(linhas)
+    if resultados.empty:
+        return resultados
+    resultados = resultados.sort_values("SCORE", ascending=False)
+    resultados = resultados[resultados["SCORE"] >= float(threshold)]
     resultados = resultados.reset_index(drop=True)
-    resultados['RANK'] = range(1, len(resultados) + 1)
-
+    resultados["RANK"] = range(1, len(resultados) + 1)
     return resultados

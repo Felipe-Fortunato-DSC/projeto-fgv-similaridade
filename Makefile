@@ -7,7 +7,7 @@ help:
 	@echo "  install  - instala dependências (requirements.txt)"
 	@echo "  run      - sobe o app Streamlit"
 	@echo "  test     - roda pytest"
-	@echo "  seed     - sobe parquet local de embeddings para o Snowflake (one-time)"
+	@echo "  seed     - sobe artefatos locais para Athena + S3 Vectors (one-time)"
 	@echo "  lint     - lint via ruff"
 	@echo "  format   - formata código via ruff"
 	@echo "  clean    - remove caches"
@@ -22,7 +22,7 @@ test:
 	pytest tests/
 
 seed:
-	python scripts/seed_snowflake.py
+	python scripts/seed_aws.py
 
 lint:
 	ruff check src tests app.py streamlit_app scripts

@@ -1,0 +1,58 @@
+# --- Segredos: NUNCA entram na imagem ---
+.streamlit/secrets.toml
+secrets.toml
+secrets.txt
+*.pem
+*.key
+
+# --- Dados pesados: a base é rehidratada do Snowflake em runtime ---
+data/input/
+data/staging/
+data/output/
+data/training/
+data/eval/
+# Recria a estrutura de pastas vazias dentro da imagem
+!data/**/.gitkeep
+
+# --- Git / CI ---
+.git/
+.gitignore
+.github/
+
+# --- Python / caches ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# --- Notebooks e material de desenvolvimento ---
+notebooks/
+.ipynb_checkpoints/
+docs/
+tests/
+scripts/
+
+# --- IDE / SO ---
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+
+# --- Artefatos de deploy (não precisam ir para dentro da imagem) ---
+deploy/
+Dockerfile
+.dockerignore
+README.md
+Makefile

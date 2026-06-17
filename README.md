@@ -1,20 +1,51 @@
 # Projeto FGV — Consulta por Similaridade (SPDO)
 
 Sistema de busca de insumos similares a partir de descrição livre, marca e medida.
-Combina **embeddings semânticos SBERT** (multilíngue PT-BR) com **busca KNN**
-(cosseno) e uma camada de **scoring composto** (similaridade de tokens + comparação
-numérica de medida). Inclui captura de feedback de validação para fine-tuning
+Combina **embeddings semânticos SBERT** (multilíngue PT-BR) com **busca k-NN no
+S3 Vectors** e uma camada de **scoring composto** (similaridade de tokens +
+comparação numérica de medida). Captura feedback de validação para fine-tuning
 futuro do modelo de embedding.
 
 ## Stack
 
 - **Python 3.11+**
 - **Streamlit** (frontend)
-- **Snowflake** (fonte de verdade dos dados)
+- **AWS Athena / Iceberg** (dados tabulares — fonte de verdade)
+- **AWS S3 Vectors** (armazenamento e busca k-NN dos embeddings)
 - **sentence-transformers** (SBERT)
-- **scikit-learn** (KNN)
 - **rapidfuzz** (similaridade de tokens)
-- **pandas / numpy / pyarrow**
+- **awswrangler / boto3** (integração AWS)
+- Deploy: **Docker → ECR → ECS (Fargate)**
+
+## Arquitetura
+
+```
+┌───────────────────────────── AWS (fonte de verdade) ─────────────────────────────┐
+│  Athena / Glue  (db_spdo_apps, Iceberg)            S3 Vectors (spdo-embeddings)   │
+│  ───────────────────────────────────────          ─────────────────────────────  │
+│  tbl_insumos                 (fonte bruta)         índice insumos-sbert-384       │
+│  tbl_insumos_padronizados    (display)             (vetores 384d, cosine)         │
+│  tbl_insumos_preprocessados  (penalização)               ▲                        │
+│  tbl_insumos_embeddings      (manifesto)  ──── cd_insumo ─┘                        │
+│  tbl_medidas_correlacao                                                            │
+│  tbl_feedback_validacoes                                                           │
+└───────────────────────────────────────────────────────────────────────────────────┘
+            ▲ metadados (cache em memória)        ▲ encode query → query_vectors(top-K)
+            │                                      │
+        ┌───┴──────────────────────────────────────┴───┐
+        │  App Streamlit (local ou ECS/Fargate)         │
+        │  SBERT encode → S3 Vectors → penalização v2   │
+        └───────────────────────────────────────────────┘
+```
+
+- **Busca**: a query é codificada pelo SBERT; o S3 Vectors retorna o top-K
+  `cd_insumo` por distância cosseno; os candidatos são hidratados a partir dos
+  metadados (cacheados em memória) e reordenados pela penalização v2.
+- **Sem cache local de vetores** — sem parquet de 764 MB, sem KNN em memória.
+- **Sincronização incremental** detecta `cd_insumo` em `tbl_insumos` ainda sem
+  embedding, codifica só esses e grava no S3 Vectors + manifesto no Athena.
+- **Feedback** vai para `tbl_feedback_validacoes` (Athena); JSONL local é buffer
+  best-effort.
 
 ## Estrutura do projeto
 
@@ -23,114 +54,71 @@ projeto_fgv_similaridade/
 ├── app.py                          # Entry point do Streamlit
 ├── requirements.txt
 ├── pyproject.toml                  # Metadata + config de tooling (pytest, ruff)
-├── Makefile                        # Comandos comuns (run, test, seed, lint)
+├── Makefile                        # run / test / seed / lint / format
+├── Dockerfile / .dockerignore      # Imagem de produção (ECR/ECS)
 ├── README.md
-├── .gitignore
 │
-├── .streamlit/
-│   ├── config.toml                 # Theme + page config
-│   ├── secrets.toml                # Credenciais Snowflake (gitignored)
-│   └── secrets.toml.example        # Template para onboarding
+├── .streamlit/config.toml          # Theme + page config
 │
 ├── src/                            # Código de domínio (pacote Python)
-│   ├── config.py                   # Paths, pesos default, versão
+│   ├── config.py                   # Paths, parâmetros do modelo, config AWS
 │   ├── data_process.py             # Padronização de texto/medidas, stopwords
 │   ├── penalty.py                  # Scoring composto v2 (token + numérica + linear)
-│   ├── similarity.py               # SBERT + KNN + consulta
-│   ├── knowledge_base.py           # Sincronização incremental Snowflake↔local
-│   ├── snowflake_io.py             # Conexão SF, DDL idempotente, read/write
-│   ├── feedback.py                 # Persistência de validações em SF + JSONL backup
+│   ├── similarity.py               # SBERT encode + S3 Vectors + penalização
+│   ├── knowledge_base.py           # Sincronização incremental (Athena → S3 Vectors)
+│   ├── aws_io.py                   # Athena (awswrangler) + S3 Vectors (boto3)
+│   ├── feedback.py                 # Persistência de validações (Athena + JSONL)
 │   └── evaluation.py               # Esqueleto Recall@k, MRR (uso futuro)
 │
-├── streamlit_app/
-│   └── services.py                 # Wrappers cacheados (modelo, KNN, feedback)
+├── streamlit_app/services.py       # Wrappers cacheados (modelo, metadados, feedback)
 │
-├── scripts/
-│   └── seed_snowflake.py           # Bootstrap one-time: parquet local → SF
+├── scripts/seed_aws.py             # Seed one-time: artefatos locais → Athena + S3 Vectors
 │
-├── tests/
-│   └── test_penalty.py             # 17 testes do módulo de scoring
+├── tests/test_penalty.py           # Testes do módulo de scoring
 │
-├── notebooks/                      # Pipeline original (referência histórica)
-│   ├── README.md
-│   ├── 0.padronizar_dados.ipynb
-│   ├── 1.embeddings.ipynb
-│   └── 2.similarity_search.ipynb
+├── deploy/                         # Tudo de infra/deploy
+│   ├── athena/schema.sql           # DDL Iceberg (estrutura das tabelas)
+│   ├── athena/query_patterns.sql   # Padrões de query (referência)
+│   ├── athena/s3vectors_setup.md   # Criação do índice S3 Vectors
+│   ├── build_and_push.ps1          # Build + push para o ECR
+│   ├── ecs-task-definition.json    # Task definition Fargate (template)
+│   ├── DEPLOY_ECS.md               # Guia de deploy
+│   └── .env.example                # Config AWS para teste local
 │
-├── docs/
-│   └── ROADMAP_FINETUNING.txt      # Plano de fine-tuning pós-meta de feedback
+├── legacy/                         # Material histórico (notebooks + roadmap)
 │
-└── data/                           # Tudo gitignored (cache local + input)
-    ├── input/                      # CSV bruto (backup/dev)
-    ├── staging/                    # Cache do KNN (mirror do SF)
-    ├── training/feedback.jsonl     # Buffer best-effort do feedback
-    ├── eval/gold_standard_template.csv
-    └── output/                     # CSVs exportados de consulta
+└── data/                           # Gitignored (artefatos do seed + buffer de feedback)
 ```
 
-## Arquitetura de dados
-
-```
-Snowflake (fonte de verdade)                Local (cache de runtime)
-─────────────────────────────                ─────────────────────────
-TBL_INSUMOS                  ── leitura ──►  (raw)
-TBL_INSUMOS_PADRONIZADOS     ◄── escrita ─── df_pad
-TBL_INSUMOS_PREPROCESSADOS   ◄── escrita ─── df_embeddings
-TBL_INSUMOS_EMBEDDINGS       ◄── escrita ─── embeddings_bp.parquet
-                              (ARRAY)              │
-TBL_MEDIDAS_CORRELACAO       ◄── escrita ─── medida_correlacao.csv
-TBL_FEEDBACK_VALIDACOES      ◄── escrita ─── feedback.jsonl (backup)
-                                                   ▼
-                                          sklearn NearestNeighbors
-                                          (KNN em memória)
-```
-
-- **SF é durável e centralizada** — múltiplas máquinas/usuários compartilham
-  a mesma base de embeddings e o mesmo histórico de feedback.
-- **Parquet local é cache** — necessário para o KNN em memória rodar rápido.
-- **Sincronização incremental** detecta `CD_INSUMO` ausentes em SF e gera
-  embeddings só para esses. No idle (nada novo) o sync termina em ~8s.
-- **Rehidratação automática** — se o cache local estiver vazio em uma máquina
-  nova, o app baixa embeddings da SF (rápido, não regera).
-- **Feedback de validação** vai para SF como fonte de verdade; JSONL local é
-  buffer best-effort (útil em dev, irrelevante no Streamlit Cloud).
-
-## Setup local
+## Setup local (apontando para a AWS real)
 
 ```powershell
-# 1. Instalar dependências
+# 1. Dependências
 pip install -r requirements.txt
 
-# 2. Configurar credenciais Snowflake
-copy .streamlit\secrets.toml.example .streamlit\secrets.toml
-# editar .streamlit\secrets.toml com as credenciais reais
+# 2. Credenciais AWS (region us-east-1)
+aws configure
 
-# 3. Bootstrap (se já tem embeddings_bp.parquet local — evita regerar)
-python scripts/seed_snowflake.py
+# 3. Criar a estrutura na AWS (uma vez)
+#    - Athena: rodar deploy/athena/schema.sql
+#    - S3 Vectors: deploy/athena/s3vectors_setup.md (create-index)
 
-# 4. Rodar a app
+# 4. Semear dados a partir dos artefatos locais (data/staging/*)
+python scripts/seed_aws.py
+
+# 5. Rodar a app
 streamlit run app.py
 ```
 
-## Setup no Streamlit Community Cloud
-
-1. Push do repositório para o GitHub.
-2. Em https://share.streamlit.io, conectar o repo e apontar para `app.py`.
-3. Em **App settings → Secrets**, colar o conteúdo do `secrets.toml` (com
-   credenciais reais). Streamlit Cloud expõe via `st.secrets`.
-4. Primeiro acesso → modal de sincronização baixa embeddings do SF.
-
 ## Fluxo no app
 
-1. **Auto-sync** ao abrir — modal mostra progresso; cache local de
-   KNN é pré-aquecido.
-2. **Consulta** — preencher descrição (obrigatório), marca e medida (opcionais),
-   ajustar pesos e threshold na sidebar.
-3. **Filtro STATUS=AT** ligado por default — esconde insumos descontinuados.
-4. **Validar/Reprovar matches** — botões por linha com popup de confirmação.
-   Cada validação grava um registro em `TBL_FEEDBACK_VALIDACOES` no SF.
-5. **Aba "Feedback registrado"** — dashboard de prontidão para fine-tuning
-   (meta: 1.000 validações + 300 queries únicas).
+1. **Auto-sync** ao abrir — verifica novos itens em `tbl_insumos`, codifica e
+   grava no S3 Vectors; pré-carrega metadados.
+2. **Consulta** — descrição (obrigatória), marca e medida (opcionais); pesos e
+   threshold ajustáveis na sidebar.
+3. **Filtro STATUS=AT** ligado por default.
+4. **Validar/Reprovar matches** — grava em `tbl_feedback_validacoes`.
+5. **Aba "Feedback registrado"** — dashboard de prontidão para fine-tuning.
 
 ## Comandos rápidos
 
@@ -138,27 +126,19 @@ streamlit run app.py
 make install   # pip install -r requirements.txt
 make run       # streamlit run app.py
 make test      # pytest
-make seed      # bootstrap one-time
+make seed      # seed AWS (one-time)
 make lint      # ruff check
 make format    # ruff format
 ```
 
-## Roadmap de fine-tuning
+## Deploy (ECR + ECS)
 
-Plano completo em **`docs/ROADMAP_FINETUNING.txt`** — 7 fases após a meta de
-coleta:
-
-1. Preparação dos dados (EDA, dedup, split estratificado por query)
-2. Hard negative mining
-3. Loop de treino com OnlineContrastiveLoss
-4. Avaliação contra baseline
-5. Versionamento e deploy
-6. A/B test no app
-7. Re-treino contínuo
+Ver **`deploy/DEPLOY_ECS.md`**. Resumo: `deploy/build_and_push.ps1 -RepoName <repo>`
+e registrar `deploy/ecs-task-definition.json`. Acesso à AWS via **task role**
+(sem secrets).
 
 ## Testes
 
 ```bash
 pytest
-# 17 testes do penalty (edge cases dos bugs corrigidos + comportamentos novos)
 ```

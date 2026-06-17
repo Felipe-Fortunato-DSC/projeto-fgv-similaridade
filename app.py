@@ -35,20 +35,20 @@ import streamlit as st
 from src.config import (
     APP_VERSION,
     DEFAULT_THRESHOLD,
+    DEFAULT_TOP_K,
     DEFAULT_WEIGHTS,
     FEEDBACK_JSONL,
 )
 from src import feedback
 from streamlit_app.services import (
     base_existe,
+    carregar_base,
     carregar_feedback_cached,
-    carregar_indice,
     carregar_modulos,
     estatisticas_detalhadas_cached,
     estatisticas_feedback_cached,
+    invalidar_cache_base,
     invalidar_cache_feedback,
-    invalidar_cache_indice,
-    parquet_mtime,
     total_codificados,
 )
 
@@ -73,7 +73,7 @@ if "evaluated_rows" not in st.session_state:
     # rank (int) -> 1 (aprovado) | 0 (reprovado)
     st.session_state.evaluated_rows = {}
 if "knn_k" not in st.session_state:
-    st.session_state.knn_k = 30
+    st.session_state.knn_k = DEFAULT_TOP_K
 if "auto_sync_done" not in st.session_state:
     st.session_state.auto_sync_done = False
 # NÃO usar setdefault para chaves ligadas a widgets — Streamlit pode ignorar
@@ -142,16 +142,15 @@ def _dialog_confirmar(row_dict: dict, label: int) -> None:
 
 @st.dialog("Sincronização automática", width="large")
 def _dialog_auto_sync() -> None:
-    """Modal exibido na abertura da app — sincroniza a base com Snowflake."""
+    """Modal exibido na abertura da app — sincroniza a base com a AWS."""
     st.markdown("### 🔄 Atualizando base de insumos")
     st.caption(
-        "Verificando se há novos itens no Snowflake "
-        "(`BASES_SPDO.DB_GESTAO_BANCO_PRECO_APP_CONSULTA.TBL_INSUMOS`). "
-        "A sincronização é **incremental** — apenas itens ausentes do cache "
-        "local geram embeddings novos."
+        "Verificando se há novos itens em `db_spdo_apps.tbl_insumos` (Athena). "
+        "A sincronização é **incremental** — apenas itens ainda sem embedding "
+        "são codificados e gravados no S3 Vectors."
     )
 
-    progress = st.progress(0.0, text="Conectando ao Snowflake…")
+    progress = st.progress(0.0, text="Consultando o Athena…")
 
     def _cb(atual: int, total: int) -> None:
         progress.progress(
@@ -166,41 +165,33 @@ def _dialog_auto_sync() -> None:
         stats = knowledge_base.sincronizar_base(progress_cb=_cb)
         progress.empty()
 
-        # Pre-warm do KNN: treina sobre a base atualizada para que a 1ª consulta
-        # seja instantânea. Sem isso, o usuário esperaria 10-20s na 1ª busca.
+        # Pré-carrega os metadados (Athena) para a 1ª consulta ser instantânea.
         if base_existe():
             warm = st.empty()
-            warm.info("⚙️ Preparando motor de busca (treinando KNN sobre a base)...")
-            carregar_indice(parquet_mtime(), st.session_state.knn_k)
+            warm.info("⚙️ Carregando metadados da base...")
+            carregar_base()
             warm.empty()
     except Exception as e:
         progress.empty()
         erro = str(e)
 
     if erro:
-        st.error(f"Não foi possível sincronizar com o Snowflake.\n\n{erro}")
-        st.caption(
-            "Você pode continuar usando o cache local — mas ele pode estar desatualizado."
-        )
+        st.error(f"Não foi possível sincronizar com a AWS.\n\n{erro}")
     elif stats:
-        if stats["novos"] == 0 and stats.get("rehidratados", 0) == 0:
+        if stats["novos"] == 0:
             total_fmt = f"{stats['total']:,}".replace(",", ".")
             st.success(f"✅ Base atualizada — **{total_fmt}** itens disponíveis.")
         else:
-            if stats.get("rehidratados", 0) > 0:
-                r_fmt = f"{stats['rehidratados']:,}".replace(",", ".")
-                st.info(f"☁️ Cache local rehidratado com **{r_fmt}** embeddings da SF.")
-            if stats["novos"] > 0:
-                tipo = "Primeira carga" if stats["primeira_carga"] else "Atualização incremental"
-                n_fmt = f"{stats['novos']:,}".replace(",", ".")
-                st.success(f"🆕 {tipo}: **{n_fmt}** novos itens processados.")
+            tipo = "Primeira carga" if stats["primeira_carga"] else "Atualização incremental"
+            n_fmt = f"{stats['novos']:,}".replace(",", ".")
+            st.success(f"🆕 {tipo}: **{n_fmt}** novos itens processados.")
             total_fmt = f"{stats['total']:,}".replace(",", ".")
             st.caption(f"Total na base de consulta: {total_fmt} itens.")
 
     st.divider()
     if st.button("Continuar →", type="primary", use_container_width=True):
         st.session_state.auto_sync_done = True
-        invalidar_cache_indice()
+        invalidar_cache_base()
         st.rerun()
 
 
@@ -228,34 +219,24 @@ with st.sidebar:
 
         try:
             stats = knowledge_base.sincronizar_base(progress_cb=_cb)
-        except FileNotFoundError as e:
-            progress.empty()
-            st.error(str(e))
-            stats = None
         except Exception as e:
             progress.empty()
-            st.error(f"Erro ao sincronizar com Snowflake: {e}")
+            st.error(f"Erro ao sincronizar com a AWS: {e}")
             stats = None
 
         if stats is not None:
             progress.empty()
-            partes = []
-            if stats.get('rehidratados', 0) > 0:
-                partes.append(f"Cache local rehidratado: {stats['rehidratados']} embeddings da SF.")
             if stats['novos'] == 0:
-                partes.append(f"Base já atualizada ({stats['total']} itens).")
-                msg = " ".join(partes)
-                st.info(msg)
+                st.info(f"Base já atualizada ({stats['total']} itens).")
             else:
                 tipo = "Primeira carga" if stats['primeira_carga'] else "Atualização incremental"
-                partes.append(f"{tipo}: {stats['novos']} novos. Total: {stats['total']}.")
-                st.success(" ".join(partes))
-            invalidar_cache_indice()
+                st.success(f"{tipo}: {stats['novos']} novos. Total: {stats['total']}.")
+            invalidar_cache_base()
             st.rerun()
 
     st.divider()
     st.header("Configuração")
-    n_neighbors = st.slider("Vizinhos (k)", 5, 50, 30)
+    n_neighbors = st.slider("Vizinhos (k)", 5, DEFAULT_TOP_K, DEFAULT_TOP_K)
     threshold = st.slider("Score mínimo", 0, 100, int(DEFAULT_THRESHOLD))
 
     with st.expander("⚖️ Pesos do score", expanded=False):
@@ -308,9 +289,8 @@ with tab_consulta:
     if not base_existe():
         st.info(
             "Sincronize a base de conhecimento no menu lateral antes da primeira consulta. "
-            "A sincronização lê `TBL_INSUMOS` do Snowflake e processa apenas registros "
-            "novos. Na primeira execução em uma máquina sem cache local, o app baixa "
-            "embeddings já presentes na SF (rápido) e gera apenas os ausentes (mais lento)."
+            "A sincronização lê `db_spdo_apps.tbl_insumos` (Athena), processa apenas "
+            "registros novos e grava os embeddings no S3 Vectors."
         )
     else:
         with st.form("formulario_consulta"):
@@ -333,7 +313,7 @@ with tab_consulta:
                 st.error("A descrição é obrigatória.")
             else:
                 similarity, _ = carregar_modulos()
-                df_embeddings, df_pad, knn = carregar_indice(parquet_mtime(), n_neighbors)
+                df_embeddings, df_pad, df_medida = carregar_base()
 
                 weights = {
                     "sbert": st.session_state.get("w_sbert", DEFAULT_WEIGHTS["sbert"]),
@@ -355,12 +335,13 @@ with tab_consulta:
                     resultados = similarity.consultar_item(
                         descricao=descricao.strip(),
                         medida=medida.strip(),
-                        knn_model=knn,
                         df_pad=df_pad,
                         df_embeddings=df_embeddings,
+                        df_medida=df_medida,
                         marca=marca.strip(),
                         weights=weights,
                         threshold=float(threshold),
+                        top_k=int(n_neighbors),
                     )
                 st.session_state.resultados = resultados
                 st.session_state.ultima_query = {
@@ -487,7 +468,7 @@ with tab_feedback:
     if stats["pronto_treino"]:
         st.success(
             "✅ **META ATINGIDA — base pronta para iniciar fine-tuning.** "
-            f"Veja `docs/ROADMAP_FINETUNING.txt` para os próximos passos."
+            f"Veja `legacy/docs/ROADMAP_FINETUNING.txt` para os próximos passos."
         )
     elif stats["total"] == 0:
         st.error(

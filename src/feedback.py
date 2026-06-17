@@ -1,11 +1,10 @@
 """Persistência de feedback de validação para fine-tuning futuro.
 
-**Snowflake é a fonte de verdade** (``TBL_FEEDBACK_VALIDACOES``). O JSONL
-local em ``data/training/feedback.jsonl`` é mantido como buffer/backup —
-útil em desenvolvimento e como fallback resiliente caso a SF esteja
-temporariamente indisponível. No Streamlit Cloud o JSONL é efêmero
-(container reinicia → arquivo some), por isso a SF é obrigatória em
-produção.
+**Athena é a fonte de verdade** (``tbl_feedback_validacoes``). O JSONL local
+em ``data/training/feedback.jsonl`` é mantido como buffer/backup — útil em
+desenvolvimento e como fallback resiliente caso a AWS esteja temporariamente
+indisponível. No container (ECS) o JSONL é efêmero (reinício → arquivo some),
+por isso o Athena é obrigatório em produção.
 
 Schema (achatado) lido pelo restante do app:
 
@@ -25,7 +24,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from .config import APP_VERSION, FEEDBACK_JSONL
-from . import snowflake_io as sf
+from . import aws_io
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +72,11 @@ def _escrever_jsonl_local(registros: list[dict]) -> None:
 
 
 def salvar_feedback(registros: list[dict]) -> int:
-    """Persiste registros no Snowflake (fonte de verdade) + buffer JSONL local.
+    """Persiste registros no Athena (fonte de verdade) + buffer JSONL local.
 
-    Sempre tenta SF primeiro. Se falhar, mantém JSONL local como rede de
-    segurança e levanta a exceção para o caller decidir como tratar.
+    Grava o buffer local primeiro (best-effort) e depois no Athena. Se o
+    Athena falhar, o JSONL local permanece como rede de segurança e a
+    exceção sobe para o caller.
     """
     if not registros:
         return 0
@@ -84,15 +84,9 @@ def salvar_feedback(registros: list[dict]) -> int:
     # Buffer local primeiro (best-effort, não bloqueia se filesystem inacessível)
     _escrever_jsonl_local(registros)
 
-    # SF — fonte de verdade
-    conn = sf.conectar()
-    try:
-        sf.garantir_tabelas(conn)
-        n = sf.insert_feedback(conn, registros)
-        logger.info("Feedback gravado no Snowflake: %d registros", n)
-        return n
-    finally:
-        conn.close()
+    n = aws_io.insert_feedback(registros)
+    logger.info("Feedback gravado no Athena: %d registros", n)
+    return n
 
 
 def _carregar_de_jsonl() -> pd.DataFrame:
@@ -111,16 +105,11 @@ def _carregar_de_jsonl() -> pd.DataFrame:
 
 
 def carregar_feedback() -> pd.DataFrame:
-    """Lê feedback do Snowflake. Fallback para JSONL se SF inacessível."""
+    """Lê feedback do Athena. Fallback para JSONL se a AWS estiver inacessível."""
     try:
-        conn = sf.conectar()
-        try:
-            sf.garantir_tabelas(conn)
-            return sf.ler_feedback(conn)
-        finally:
-            conn.close()
+        return aws_io.ler_feedback()
     except Exception as e:
-        logger.warning("Falha ao ler feedback do SF, usando JSONL local: %s", e)
+        logger.warning("Falha ao ler feedback do Athena, usando JSONL local: %s", e)
         return _carregar_de_jsonl()
 
 
@@ -138,7 +127,7 @@ def estatisticas_feedback() -> dict:
     }
 
 
-# Metas para iniciar fine-tuning (ver docs/ROADMAP_FINETUNING.txt)
+# Metas para iniciar fine-tuning (ver legacy/docs/ROADMAP_FINETUNING.txt)
 META_VALIDACOES = 1000
 META_QUERIES_UNICAS = 300
 META_MIN_VAL_POR_QUERY = 3
